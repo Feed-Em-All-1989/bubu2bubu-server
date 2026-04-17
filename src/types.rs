@@ -35,6 +35,12 @@ pub enum ClientMsg {
         image: String,
         metadata: StegoMetadata,
     },
+    #[serde(rename = "set_profile")]
+    SetProfile {
+        key_tag: String,
+        name: String,
+        avatar: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,5 +59,13 @@ pub enum ServerMsg {
         reply_to: Option<String>,
         image: String,
         metadata: StegoMetadata,
+    },
+    #[serde(rename = "user_list")]
+    UserList { users: Vec<String> },
+    #[serde(rename = "profile_update")]
+    ProfileUpdate {
+        key_tag: String,
+        name: String,
+        avatar: Option<String>,
     },
 }

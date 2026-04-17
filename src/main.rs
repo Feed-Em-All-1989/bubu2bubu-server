@@ -4,7 +4,7 @@ mod types;
 
 use noise::build_responder;
 use protocol::{send_frame, recv_frame, send_noise_msg, recv_noise_msg};
-use types::{ClientMsg, ServerMsg};
+use types::{ClientMsg, ServerMsg};  
 use noise::NoiseResponder;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,8 +19,14 @@ type Clients = Arc<Mutex<HashMap<u64, ClientEntry>>>;
 
 struct ClientEntry {
     name: String,
+    key_tag: String,
+    avatar: Option<String>,
     transport: Arc<Mutex<NoiseResponder>>,
     writer: Arc<Mutex<OwnedWriteHalf>>,
+}
+
+fn collect_user_names(map: &HashMap<u64, ClientEntry>) -> Vec<String> {
+    map.values().map(|e| e.name.clone()).collect()
 }
 
 fn generate_room_key() -> String {
@@ -97,7 +103,7 @@ async fn handle_client(
     let join_data = recv_noise_msg(&mut reader, &transport).await?;
     let join_msg: ClientMsg = serde_json::from_slice(&join_data).map_err(|e| e.to_string())?;
 
-    let client_name = match join_msg {
+    let mut client_name = match join_msg {
         ClientMsg::Join { name } => name,
         _ => return Err("expected join message".into()),
     };
@@ -113,6 +119,8 @@ async fn handle_client(
         let mut map = clients.lock().await;
         map.insert(id, ClientEntry {
             name: client_name.clone(),
+            key_tag: String::new(),
+            avatar: None,
             transport: transport.clone(),
             writer: writer.clone(),
         });
@@ -121,10 +129,26 @@ async fn handle_client(
 
         let joined = ServerMsg::Joined { name: client_name.clone(), online };
         let data = serde_json::to_vec(&joined).unwrap();
+        let user_list = ServerMsg::UserList { users: collect_user_names(&map) };
+        let ul_data = serde_json::to_vec(&user_list).unwrap();
         for (&cid, entry) in map.iter() {
             if cid == id { continue; }
             let mut w = entry.writer.lock().await;
             let _ = send_noise_msg(&mut *w, &entry.transport, &data).await;
+            let _ = send_noise_msg(&mut *w, &entry.transport, &ul_data).await;
+        }
+        let mut w = writer.lock().await;
+        let _ = send_noise_msg(&mut *w, &transport, &ul_data).await;
+
+        for entry in map.values() {
+            if entry.key_tag.is_empty() { continue; }
+            let profile = ServerMsg::ProfileUpdate {
+                key_tag: entry.key_tag.clone(),
+                name: entry.name.clone(),
+                avatar: entry.avatar.clone(),
+            };
+            let pd = serde_json::to_vec(&profile).unwrap();
+            let _ = send_noise_msg(&mut *w, &transport, &pd).await;
         }
     }
 
@@ -141,14 +165,45 @@ async fn handle_client(
 
         match msg {
             ClientMsg::Chat { id: msg_id, reply_to, image, metadata } => {
+                let sender = {
+                    let map = clients.lock().await;
+                    map.get(&id).map(|e| e.name.clone()).unwrap_or_default()
+                };
                 let relay = ServerMsg::Chat {
-                    sender: client_name.clone(),
+                    sender,
                     id: msg_id,
                     reply_to,
                     image,
                     metadata,
                 };
                 broadcast(&clients, id, &relay).await;
+            }
+            ClientMsg::SetProfile { key_tag, name, avatar } => {
+                let name_changed = {
+                    let mut map = clients.lock().await;
+                    let changed = if let Some(entry) = map.get_mut(&id) {
+                        let changed = entry.name != name;
+                        entry.key_tag = key_tag.clone();
+                        entry.name = name.clone();
+                        entry.avatar = avatar.clone();
+                        if changed { client_name = name.clone(); }
+                        changed
+                    } else {
+                        false
+                    };
+                    changed
+                };
+                let update = ServerMsg::ProfileUpdate { key_tag, name, avatar };
+                broadcast_all(&clients, &update).await;
+                if name_changed {
+                    let map = clients.lock().await;
+                    let user_list = ServerMsg::UserList { users: collect_user_names(&map) };
+                    let ul_data = serde_json::to_vec(&user_list).unwrap();
+                    for entry in map.values() {
+                        let mut w = entry.writer.lock().await;
+                        let _ = send_noise_msg(&mut *w, &entry.transport, &ul_data).await;
+                    }
+                }
             }
             _ => {}
         }
@@ -164,7 +219,32 @@ async fn handle_client(
     let left = ServerMsg::Left { name: client_name, online };
     broadcast(&clients, id, &left).await;
 
+    {
+        let map = clients.lock().await;
+        let user_list = ServerMsg::UserList { users: collect_user_names(&map) };
+        let ul_data = serde_json::to_vec(&user_list).unwrap();
+        for entry in map.values() {
+            let mut w = entry.writer.lock().await;
+            let _ = send_noise_msg(&mut *w, &entry.transport, &ul_data).await;
+        }
+    }
+
     Ok(())
+}
+
+async fn broadcast_all(clients: &Clients, msg: &ServerMsg) {
+    let data = serde_json::to_vec(msg).unwrap();
+    let targets: Vec<(Arc<Mutex<NoiseResponder>>, Arc<Mutex<OwnedWriteHalf>>)> = {
+        let map = clients.lock().await;
+        map.values()
+            .map(|e| (e.transport.clone(), e.writer.clone()))
+            .collect()
+    };
+
+    for (transport, writer) in targets {
+        let mut w = writer.lock().await;
+        let _ = send_noise_msg(&mut *w, &transport, &data).await;
+    }
 }
 
 async fn broadcast(clients: &Clients, sender_id: u64, msg: &ServerMsg) {
